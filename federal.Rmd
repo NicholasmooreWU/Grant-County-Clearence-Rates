@@ -1,0 +1,268 @@
+---
+title: "federal"
+output: html_document
+date: "2026-05-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# ✅ FIX: Load the dataset here so ALL chunks below can see it
+# Update this path to match where your .rda file actually lives
+load("C:/Users/nomoo/OneDrive/Documents/ICPSR_39270-V2/ICPSR_39270/DS0003/39270-0003-Data.rda")
+library(tidyr)
+```
+
+
+
+```{r}
+library(dplyr)
+
+# ==========================================
+# 1. Feature Engineering: All-in-One Step
+# ==========================================
+model_data <- da39270.0003 %>%
+  filter(ORI == "WA0130000") %>%
+  mutate(
+    # THE TARGET: Did an arrest happen?
+    is_cleared = as.factor(ifelse(RECSARR > 0, "Cleared", "Not Cleared")),
+    
+    # OFFENSE COUNT: Single vs. Multiple
+    OFFENSE_GROUP = case_when(
+      as.numeric(RECSOFS) == 1 ~ "Single Offense",
+      as.numeric(RECSOFS) > 1  ~ "Multiple Offenses",
+      TRUE ~ "Unknown"
+    ),
+    
+    # TIME OF DAY: Grouped into Police Patrol Shifts
+    hour_num = as.numeric(V20111),
+    SHIFT = case_when(
+      hour_num >= 6 & hour_num < 14 ~ "Day Shift (0600-1359)",
+      hour_num >= 14 & hour_num < 22 ~ "Swing Shift (1400-2159)",
+      hour_num >= 22 | hour_num < 6  ~ "Graveyard Shift (2200-0559)",
+      TRUE ~ "Unknown Time"
+    ),
+    
+    # VICTIM AGE: Grouped into life stages
+    age_num = as.numeric(V40181),
+    AGE_GROUP = case_when(
+      age_num < 18 ~ "Juvenile (<18)",
+      age_num >= 18 & age_num < 65 ~ "Adult (18-64)",
+      age_num >= 65 ~ "Senior (65+)",
+      TRUE ~ "Unknown Age"
+    ),
+    
+    # CRIME TYPE: Keeping the full text label!
+    CRIME_CATEGORY = as.character(V20061)
+  ) %>%
+  
+  # NOW we drop the raw data, keeping only our clean features
+  select(is_cleared, OFFENSE_GROUP, SHIFT, AGE_GROUP, CRIME_CATEGORY)
+
+# ==========================================
+# 2. View Clearance Rates by Offense Group
+# ==========================================
+offense_summary <- model_data %>%
+  group_by(OFFENSE_GROUP) %>%
+  summarize(
+    Total_Incidents = n(),
+    Cleared_Count = sum(is_cleared == "Cleared"),
+    Clearance_Rate_Pct = round((Cleared_Count / Total_Incidents) * 100, 1)
+  ) %>%
+  arrange(desc(Clearance_Rate_Pct))
+
+print(offense_summary)
+
+
+library(GGally)
+
+# ==========================================
+# Generate the Categorical Pairs Plot
+# ==========================================
+plot_data_categorical <- model_data %>%
+  select(is_cleared, OFFENSE_GROUP, SHIFT, AGE_GROUP) %>%
+  mutate(across(everything(), as.factor)) %>%
+  drop_na()
+
+ggpairs(
+  plot_data_categorical, 
+  title = "Grant County Sheriff: Categorical Variables Pairs Plot",
+  mapping = aes(color = is_cleared, fill = is_cleared, alpha = 0.6)
+)
+```
+
+
+
+```{r}
+library(ggplot2)
+
+# Calculate stats by Crime Category
+crime_rank <- model_data %>%
+  group_by(CRIME_CATEGORY) %>%
+  summarize(
+    Total = n(),
+    Clearance_Rate = sum(is_cleared == "Cleared") / n()
+  ) %>%
+  filter(Total >= 10) %>%
+  arrange(desc(Clearance_Rate))
+
+# Create the Plot
+ggplot(crime_rank, aes(x = reorder(CRIME_CATEGORY, Clearance_Rate), y = Clearance_Rate)) +
+  geom_col(aes(fill = Clearance_Rate)) +
+  scale_fill_gradient(low = "firebrick", high = "forestgreen") +
+  coord_flip() +
+  labs(
+    title = "Grant County Sheriff: Clearance Rates by Crime Type",
+    subtitle = "Crimes with 10+ incidents; Sorted by success rate",
+    x = "Type of Offense",
+    y = "Percentage of Cases Cleared (Arrest Made)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(broom)
+
+# ==========================================
+# 1. DATA PREPARATION & CLEANING
+# ==========================================
+final_analysis_data <- da39270.0003 %>%
+  filter(ORI == "WA0130000") %>%
+  mutate(
+    target = ifelse(RECSARR > 0, 1, 0),
+    
+    OFFENSE_GROUP = case_when(
+      as.numeric(RECSOFS) == 1 ~ "Single Offense",
+      as.numeric(RECSOFS) > 1  ~ "Multiple Offenses",
+      TRUE ~ "Unknown"
+    ),
+    
+    SHIFT = case_when(
+      as.numeric(V20111) >= 6 & as.numeric(V20111) < 14 ~ "Day",
+      as.numeric(V20111) >= 14 & as.numeric(V20111) < 22 ~ "Swing",
+      TRUE ~ "Graveyard"
+    ),
+    
+    AGE_GROUP = case_when(
+      as.numeric(V40181) < 18 ~ "Juvenile (<18)",
+      as.numeric(V40181) >= 18 & as.numeric(V40181) < 65 ~ "Adult (18-64)",
+      as.numeric(V40181) >= 65 ~ "Senior (65+)",
+      TRUE ~ "Unknown Age"
+    ),
+    
+    LOCATION_GROUP = case_when(
+      V20121 %in% c("20", "01", "18") ~ "Residential/Home",
+      V20121 %in% c("03", "05", "07", "08", "12", "14", "21", "24") ~ "Commercial/Retail",
+      V20121 %in% c("13", "10", "16", "22") ~ "Public Space/Parking",
+      TRUE ~ "Other/Specialized"
+    ),
+    
+    CRIME = as.character(V20061)
+  ) %>%
+  filter(AGE_GROUP != "Unknown Age", !is.na(SHIFT))
+
+# ==========================================
+# 2. LOGISTIC REGRESSION (The Forest Plot)
+# ==========================================
+logit_model <- glm(target ~ OFFENSE_GROUP + SHIFT + AGE_GROUP, 
+                   data = final_analysis_data, 
+                   family = binomial)
+
+model_viz_data <- tidy(logit_model, conf.int = TRUE, exponentiate = TRUE) %>%
+  filter(term != "(Intercept)")
+
+forest_plot <- ggplot(model_viz_data, aes(x = estimate, y = term)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "red") +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2) +
+  geom_point(size = 3, color = "darkblue") +
+  labs(title = "What Predicts Case Clearance in Grant County?",
+       x = "Odds Ratio (Left of Red Line = Lower Success)",
+       y = "Variable") +
+  theme_minimal()
+
+# ==========================================
+# 3. PREDICTIVE CRIME TABLE
+# ==========================================
+predictive_table <- final_analysis_data %>%
+  group_by(LOCATION_GROUP, SHIFT) %>%
+  mutate(sector_total = n()) %>%
+  group_by(LOCATION_GROUP, SHIFT, CRIME) %>%
+  summarize(Prob = n() / first(sector_total), .groups = "drop") %>%
+  group_by(LOCATION_GROUP, SHIFT) %>%
+  slice_max(order_by = Prob, n = 1)
+
+# ==========================================
+# 4. VIEW RESULTS
+# ==========================================
+print(forest_plot)
+print(predictive_table)
+```
+
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(haven)
+library(forcats)
+
+viz_data <- da39270.0003 %>%
+  filter(ORI == "WA0130000") %>%
+  mutate(
+    crime_name = as_factor(V20061),
+    hour_num   = as.numeric(V20111),
+
+    time_of_day = case_when(
+      hour_num >= 0  & hour_num < 6   ~ "Late Night\n(12–6am)",
+      hour_num >= 6  & hour_num < 12  ~ "Morning\n(6am–12pm)",
+      hour_num >= 12 & hour_num < 18  ~ "Afternoon\n(12–6pm)",
+      hour_num >= 18 & hour_num <= 23 ~ "Evening\n(6–12pm)",
+      TRUE ~ NA_character_
+    ),
+
+    time_of_day = factor(time_of_day, levels = c(
+      "Late Night\n(12–6am)",
+      "Morning\n(6am–12pm)",
+      "Afternoon\n(12–6pm)",
+      "Evening\n(6–12pm)"
+    )),
+
+    crime_name = fct_lump_n(crime_name, n = 8, other_level = "All Other Crimes")
+  ) %>%
+  filter(!is.na(time_of_day))
+
+crime_counts <- viz_data %>%
+  count(time_of_day, crime_name) %>%
+  group_by(time_of_day) %>%
+  mutate(
+    pct   = n / sum(n),
+    label = paste0(round(pct * 100), "%")
+  )
+
+ggplot(crime_counts, aes(x = time_of_day, y = pct, fill = crime_name)) +
+  geom_col(position = "stack", width = 0.7) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_fill_brewer(palette = "Set3") +
+  labs(
+    title    = "Crime Type Distribution by Time of Day",
+    subtitle = "Moses Lake, WA — proportion of each crime type per time window",
+    x        = NULL,
+    y        = "Share of Incidents (%)",
+    fill     = "Crime Type"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position  = "bottom",
+    legend.title     = element_text(face = "bold"),
+    plot.title       = element_text(face = "bold"),
+    axis.text.x      = element_text(size = 11)
+  ) +
+  guides(fill = guide_legend(nrow = 3))
+
+ggsave("crime_by_time.png", width = 10, height = 7, dpi = 150)
+```
